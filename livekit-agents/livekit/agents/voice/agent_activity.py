@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from .filler_filter import FillerWordFilter
-from typing import Dict   # for static analysis only
+from .voice_interruption_filter import SmartVoiceInterruptionHandler
+from typing import Dict 
 import asyncio
 import contextvars
 import heapq
@@ -91,9 +91,10 @@ class AgentActivity(RecognitionHooks):
     def __init__(self, agent: Agent, sess: AgentSession) -> None:
 
         # Initialize filler word filter
-        self._filler_filter = FillerWordFilter(
-            enable_logging=True  # Can be made configurable later
-        )
+        self._voice_handler = SmartVoiceInterruptionHandler(
+        debug_mode=True,
+        use_ml_enhancement=True  # Bonus: ML feature enabled
+)
 
         self._agent, self._session = agent, sess
         self._rt_session: llm.RealtimeSession | None = None
@@ -1189,43 +1190,79 @@ class AgentActivity(RecognitionHooks):
 
     def on_interim_transcript(self, ev: stt.SpeechEvent, *, speaking: bool | None) -> None:
         if isinstance(self.llm, llm.RealtimeModel) and self.llm.capabilities.user_transcription:
-            # skip stt transcription if user_transcription is enabled on the realtime model
             return
 
-        #Define the variables for easier access
+        # Extract transcript data
+        user_utterance = ev.alternatives[0].text
         transcript = ev.alternatives[0].text
         confidence = ev.alternatives[0].confidence
+        confidence_score = ev.alternatives[0].confidence
         
-        # ============ FILLER WORD FILTERING LOGIC ============
-        # Check if agent is currently speaking
-        agent_is_speaking = (
+        # Determine current agent state
+        is_agent_active = (
             self._current_speech is not None 
             and not self._current_speech.interrupted
             and not self._current_speech.done()
         )
-        
-        # If agent is speaking and this is filler-only, ignore the interruption
-        if agent_is_speaking and transcript:
-            if self._filler_filter.is_filler_only(transcript, confidence):
+
+        # Apply smart filtering when agent is actively speaking
+        if is_agent_active and user_utterance:
+            should_suppress = self._voice_handler.should_ignore_utterance(
+                user_utterance, 
+                confidence_score
+            )
+            
+            if should_suppress:
                 logger.info(
-                    f"🚫 Filler ignored while agent speaking: '{transcript}'",
-                    extra={"confidence": confidence, "agent_speaking": True}
+                    f"🛑 Suppressed interruption: '{user_utterance}'",
+                    extra={"confidence": confidence_score, "agent_active": True}
                 )
-                # Still emit the transcript event for logging, but DON'T interrupt
+                # Emit transcription event but prevent interruption
                 self._session._user_input_transcribed(
                     UserInputTranscribedEvent(
                         language=ev.alternatives[0].language,
-                        transcript=transcript,
+                        transcript=user_utterance,
                         is_final=False,
                         speaker_id=ev.alternatives[0].speaker_id,
                     ),
                 )
-                return  # EXIT EARLY - Don't call _interrupt_by_audio_activity()
+                return  # Skip interruption logic
             else:
                 logger.info(
-                    f"✅ Real interruption allowed: '{transcript}'",
-                    extra={"confidence": confidence, "agent_speaking": True}
-                )
+                    f"✅ Genuine speech - allowing interruption: '{user_utterance}'",
+                    extra={"confidence": confidence_score, "agent_active": True}
+                )        
+            
+            # ============ FILLER WORD FILTERING LOGIC ============
+            # Check if agent is currently speaking
+            agent_is_speaking = (
+                self._current_speech is not None 
+                and not self._current_speech.interrupted
+                and not self._current_speech.done()
+            )
+            
+            # If agent is speaking and this is filler-only, ignore the interruption
+            if agent_is_speaking and transcript:
+                if self._filler_filter.is_filler_only(transcript, confidence):
+                    logger.info(
+                        f"🚫 Filler ignored while agent speaking: '{transcript}'",
+                        extra={"confidence": confidence, "agent_speaking": True}
+                    )
+                    # Still emit the transcript event for logging, but DON'T interrupt
+                    self._session._user_input_transcribed(
+                        UserInputTranscribedEvent(
+                            language=ev.alternatives[0].language,
+                            transcript=transcript,
+                            is_final=False,
+                            speaker_id=ev.alternatives[0].speaker_id,
+                        ),
+                    )
+                    return  # EXIT EARLY - Don't call _interrupt_by_audio_activity()
+                else:
+                    logger.info(
+                        f"✅ Real interruption allowed: '{transcript}'",
+                        extra={"confidence": confidence, "agent_speaking": True}
+                    )
         # ============ END FILLER FILTERING ============
 
         # Original logic continues for non-filler interruptions
@@ -2468,10 +2505,10 @@ class AgentActivity(RecognitionHooks):
             self._agent.llm if is_given(self._agent.llm) else self._session.llm,
         )
 
-    def get_filler_stats(self) -> Dict[str, int]:
-        """Get filler word filtering statistics"""
-        return self._filler_filter.get_stats()
-    
+    def get_interruption_metrics(self) -> Dict[str, int]:
+        """Retrieve voice interruption handling metrics"""
+        return self._voice_handler.get_performance_metrics()
+        
     @property
     def tts(self) -> tts.TTS | None:
         return self._agent.tts if is_given(self._agent.tts) else self._session.tts
